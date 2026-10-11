@@ -124,6 +124,11 @@ impl Session {
             }
         };
 
+        // tokio expects a non-blocking socket: on a blocking one a recv
+        // made while it still takes the socket for readable blocks the
+        // whole runtime until the worker's next message.
+        parentfd.set_nonblocking(true)?;
+
         Ok(Session {
             task: child,
             sock: TokioUnixDatagram::from_std(parentfd)?,
