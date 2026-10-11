@@ -28,6 +28,9 @@ pub enum TerminalMode {
         vt: usize,
         switch: bool,
     },
+    /// A free VT of the session's own, found when the session is started
+    /// and switched to once its PAM session is open, in graphics mode.
+    Handover,
     Stdin,
 }
 
@@ -92,6 +95,19 @@ impl SessionChildToParent {
         let out = serde_json::to_vec(self)?;
         sock.send(&out)?;
         Ok(())
+    }
+}
+
+/// A session's VT in graphics mode, put back in text mode when dropped. One
+/// left in graphics mode with nobody to ask for a switch cannot be left:
+/// the kernel ignores every switch away from it, the greeter's included.
+struct GraphicsVt(usize);
+
+impl Drop for GraphicsVt {
+    fn drop(&mut self) {
+        if let Ok(term) = terminal::Terminal::open(&format!("/dev/tty{}", self.0)) {
+            let _ = term.kd_setmode(terminal::KdMode::Text);
+        }
     }
 }
 
@@ -166,8 +182,25 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
     // Make this process a session leader.
     setsid().map_err(|e| format!("unable to become session leader: {}", e))?;
 
+    // The VT to switch to once the PAM session is open, and the VT that was:
+    // in text mode again however this ends, an error after the switch too.
+    let mut handover = None;
+    let mut handover_vt: Option<GraphicsVt> = None;
+
     match tty {
         TerminalMode::Stdin => (),
+        TerminalMode::Handover => {
+            let vt = terminal::Terminal::open("/dev/tty0")?.vt_get_next()?;
+
+            pam.set_item(PamItemType::TTY, &format!("tty{}", vt))?;
+            pam.putenv(&format!("XDG_VTNR={}", vt))?;
+
+            let target_term = terminal::Terminal::open(&format!("/dev/tty{}", vt))?;
+            target_term.term_clear()?;
+            target_term.term_connect_pipes()?;
+            target_term.term_take_ctty()?;
+            handover = Some((target_term, vt));
+        }
         TerminalMode::Terminal { path, vt, switch } => {
             // Tell PAM what TTY we're targetting, which is used by logind.
             pam.set_item(PamItemType::TTY, &format!("tty{}", vt))?;
@@ -220,6 +253,23 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
 
     // Session time!
     pam.open_session(PamFlag::NONE)?;
+
+    // The switch comes last: logind knows of the session on the VT by now,
+    // and starts no getty on it, and little is left that can fail with the
+    // greeter out of sight.
+    if let Some((target_term, vt)) = handover {
+        // Graphics mode, so that the console draws nothing on this VT: what
+        // the greeter last showed stays on the display until the session's
+        // compositor takes it. Not before this point, and undone if the
+        // switch fails: the VT of a session that does not start stays in
+        // text mode.
+        target_term.kd_setmode(terminal::KdMode::Graphics)?;
+        if let Err(e) = target_term.vt_setactivate(vt) {
+            let _ = target_term.kd_setmode(terminal::KdMode::Text);
+            return Err(e);
+        }
+        handover_vt = Some(GraphicsVt(vt));
+    }
 
     // We are done with PAM, clear variables that the child will not need.
     _ = pam.putenv(&"XDG_SESSION_CLASS");
@@ -299,6 +349,12 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
             Ok(_) => break,
         }
     }
+
+    // A session that ended with no compositor ever on its VT has left it in
+    // graphics mode, with nobody to ask for a switch: the kernel ignores
+    // every switch away from such a VT, the next greeter's included. A
+    // compositor's VT is in text mode again by now, and this does nothing.
+    drop(handover_vt.take());
 
     // Close the session. This step requires root privileges to run, as it
     // will result in various forms of login teardown (including unmounting

@@ -47,6 +47,22 @@ This section contains terminal configuration.
 
 	Default is true.
 
+*handover* = true|false
+	Whether a session a greeter starts gets a VT of its own.
+
+	If set to false, greetd waits for the greeter to exit and starts the
+	session on *vt*, in text mode. The VT shows between the two.
+
+	If set to true, the session is started at once on the next free VT, in
+	graphics mode, and switched to once its PAM session is open. The greeter
+	is left running on *vt* for a few seconds and then terminated, so that
+	what it last showed stays on the display until the session's compositor
+	takes it. Meant for graphical sessions: a textual one has a VT in
+	graphics mode to cope with. Needs *vt* to be a VT, and has no effect on
+	*initial_session*.
+
+	Default is false.
+
 ## general
 
 This section contains general configuration that does not fit in other sections

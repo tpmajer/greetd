@@ -50,6 +50,7 @@ pub struct ConfigInternal {
 pub struct ConfigTerminal {
     pub vt: VtSelection,
     pub switch: bool,
+    pub handover: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -186,6 +187,11 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
                 .unwrap_or(&"true")
                 .parse()
                 .map_err(|e| format!("could not parse switch: {}", e))?,
+            handover: section
+                .get("handover")
+                .unwrap_or(&"false")
+                .parse()
+                .map_err(|e| format!("could not parse handover: {}", e))?,
         }),
         None => Err("no terminal specified"),
     }?;
@@ -293,6 +299,7 @@ command = \"agreety\"
                 terminal: ConfigTerminal {
                     vt: VtSelection::Specific(1),
                     switch: true,
+                    handover: false,
                 },
                 default_session: ConfigSession {
                     command: "agreety".to_string(),
@@ -322,6 +329,7 @@ user = \"john\"
                 terminal: ConfigTerminal {
                     vt: VtSelection::Specific(1),
                     switch: true,
+                    handover: false,
                 },
                 default_session: ConfigSession {
                     command: "agreety".to_string(),
@@ -355,6 +363,7 @@ runfile = \"/path/to/greetd.state\"
                 terminal: ConfigTerminal {
                     vt: VtSelection::Specific(1),
                     switch: true,
+                    handover: false,
                 },
                 default_session: ConfigSession {
                     command: "agreety".to_string(),
@@ -384,6 +393,36 @@ source_profile = fals
     }
 
     #[test]
+    fn handover() {
+        let config = parse_config(
+            "
+[default_session]\ncommand = \"agreety\"
+[terminal]
+vt = 1
+handover = true
+",
+        )
+        .expect("config didn't parse");
+        assert_eq!(
+            config.terminal,
+            ConfigTerminal {
+                vt: VtSelection::Specific(1),
+                switch: true,
+                handover: true,
+            }
+        );
+        assert!(parse_config(
+            "
+[default_session]\ncommand = \"agreety\"
+[terminal]
+vt = 1
+handover = maybe
+",
+        )
+        .is_err());
+    }
+
+    #[test]
     fn terminal() {
         let config = parse_config(
             "
@@ -399,6 +438,7 @@ vt = 1
                 terminal: ConfigTerminal {
                     vt: VtSelection::Specific(1),
                     switch: true,
+                    handover: false,
                 },
                 default_session: ConfigSession {
                     command: "agreety".to_string(),
@@ -423,6 +463,7 @@ vt = next
                 terminal: ConfigTerminal {
                     vt: VtSelection::Next,
                     switch: true,
+                    handover: false,
                 },
                 default_session: ConfigSession {
                     command: "agreety".to_string(),
@@ -447,6 +488,7 @@ vt = current
                 terminal: ConfigTerminal {
                     vt: VtSelection::Current,
                     switch: true,
+                    handover: false,
                 },
                 default_session: ConfigSession {
                     command: "agreety".to_string(),

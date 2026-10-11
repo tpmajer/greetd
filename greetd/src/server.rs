@@ -27,7 +27,7 @@ fn reset_vt(term_mode: &TerminalMode) -> Result<(), Error> {
             term.kd_setmode(terminal::KdMode::Text)?;
             term.vt_setactivate(*vt)?;
         }
-        TerminalMode::Stdin => (),
+        TerminalMode::Stdin | TerminalMode::Handover => (),
     }
     Ok(())
 }
@@ -38,7 +38,7 @@ fn wait_vt(term_mode: &TerminalMode) -> Result<(), Error> {
             let term = Terminal::open(path)?;
             term.vt_waitactive(*vt)?;
         }
-        TerminalMode::Stdin => (),
+        TerminalMode::Stdin | TerminalMode::Handover => (),
     }
     Ok(())
 }
@@ -313,6 +313,7 @@ pub async fn main(config: Config) -> Result<(), Error> {
         greeter_service.to_string(),
         service.to_string(),
         term_mode.clone(),
+        config.file.terminal.handover,
         config.file.general.source_profile,
         config.file.general.runfile,
         listener_path,

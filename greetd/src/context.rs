@@ -17,6 +17,7 @@ use crate::{
         interface::{Session, SessionChild, SessionState},
         worker::{AuthMessageType as SessAuthMessageType, SessionClass, TerminalMode},
     },
+    terminal::Terminal,
 };
 use greetd_ipc::AuthMessageType;
 
@@ -35,7 +36,14 @@ struct ContextInner {
     current: Option<SessionChildSet>,
     scheduled: Option<SessionSet>,
     configuring: Option<SessionSet>,
+    /// The greeter that handed over to `current`, kept for a moment.
+    outgoing: Option<SessionChildSet>,
 }
+
+/// How long a greeter is kept after it has handed over, in seconds: what it
+/// last showed is on the display until the session's compositor takes it,
+/// and would go with the greeter.
+const HANDOVER_GRACE: u32 = 3;
 
 /// Context keeps track of running sessions and start new ones.
 pub struct Context {
@@ -45,6 +53,9 @@ pub struct Context {
     greeter_service: String,
     pam_service: String,
     term_mode: TerminalMode,
+    /// Where an authenticated session goes: the greeter's VT, or with a
+    /// hand-over one of its own.
+    session_term_mode: TerminalMode,
     source_profile: bool,
     runfile: String,
     listener_path: String,
@@ -57,21 +68,29 @@ impl Context {
         greeter_service: String,
         pam_service: String,
         term_mode: TerminalMode,
+        handover: bool,
         source_profile: bool,
         runfile: String,
         listener_path: String,
     ) -> Context {
+        // A hand-over needs VTs to hand over between.
+        let session_term_mode = match (&term_mode, handover) {
+            (TerminalMode::Terminal { .. }, true) => TerminalMode::Handover,
+            _ => term_mode.clone(),
+        };
         Context {
             inner: RwLock::new(ContextInner {
                 current: None,
                 scheduled: None,
                 configuring: None,
+                outgoing: None,
             }),
             greeter_bin,
             greeter_user,
             greeter_service,
             pam_service,
             term_mode,
+            session_term_mode,
             source_profile,
             runfile,
             listener_path,
@@ -201,7 +220,7 @@ impl Context {
                 SessionClass::User,
                 &username,
                 true,
-                &self.term_mode,
+                &self.session_term_mode,
                 self.source_profile,
                 &self.listener_path,
             )
@@ -276,6 +295,10 @@ impl Context {
                     // Send our arguments to the session.
                     s.session.send_args(cmd, env).await?;
 
+                    if let TerminalMode::Handover = self.session_term_mode {
+                        return self.hand_over(s).await;
+                    }
+
                     let mut inner = self.inner.write().await;
                     std::mem::swap(&mut session, &mut inner.scheduled);
                     drop(inner);
@@ -298,10 +321,91 @@ impl Context {
         }
     }
 
+    /// Start the session on a VT of its own at once, with the greeter still
+    /// up on its VT, and retire the greeter a moment later.
+    async fn hand_over(&self, s: &mut SessionSet) -> Result<(), Error> {
+        let child = match s.session.start().await {
+            Ok(child) => child,
+            Err(e) => {
+                // The worker may have switched VTs already: back to the
+                // greeter's, which is still there to say what happened.
+                self.request_greeter_vt();
+                return Err(format!("session start failed: {}", e).into());
+            }
+        };
+
+        let mut inner = self.inner.write().await;
+        inner.outgoing = inner.current.take().map(|g| SessionChildSet {
+            time: Instant::now(),
+            ..g
+        });
+        inner.current = Some(SessionChildSet {
+            child,
+            time: Instant::now(),
+            is_greeter: false,
+        });
+        alarm::set(HANDOVER_GRACE);
+        Ok(())
+    }
+
+    /// Ask for the greeter's VT, without waiting for it.
+    fn request_greeter_vt(&self) {
+        if let TerminalMode::Terminal { path, vt, .. } = &self.term_mode {
+            if let Ok(term) = Terminal::open(path) {
+                let _ = term.vt_request(*vt);
+            }
+        }
+    }
+
+    /// Start a greeter after a session. A hand-over left the greeter's VT,
+    /// and a greeter that does not switch would not come back to it.
+    async fn start_next_greeter(&self) -> Result<SessionChild, Error> {
+        if let TerminalMode::Handover = self.session_term_mode {
+            self.release_stuck_vt();
+            if let TerminalMode::Terminal { switch: false, .. } = self.term_mode {
+                self.request_greeter_vt();
+            }
+        }
+        self.start_greeter().await
+    }
+
+    /// A session's worker that was killed did not put its VT back in text
+    /// mode. If the VT in front is in graphics mode with no process to ask
+    /// for a switch, the kernel ignores every switch away from it, and the
+    /// greeter would wait for its VT for good: back to text.
+    fn release_stuck_vt(&self) {
+        let greeter_vt = match &self.term_mode {
+            TerminalMode::Terminal { vt, .. } => *vt,
+            _ => return,
+        };
+        let current = match Terminal::open("/dev/tty0").and_then(|t| t.vt_get_current()) {
+            Ok(vt) => vt,
+            Err(_) => return,
+        };
+        if current == greeter_vt {
+            return;
+        }
+        if let Ok(term) = Terminal::open(&format!("/dev/tty{}", current)) {
+            if let Ok(true) = term.vt_is_auto() {
+                let _ = term.kd_setmode(crate::terminal::KdMode::Text);
+            }
+        }
+    }
+
     /// Notify the Context of an alarm.
     pub async fn alarm(&self) -> Result<(), Error> {
         // Keep trying to terminate the greeter until it gives up.
         let mut inner = self.inner.write().await;
+
+        // A greeter kept through a hand-over has had its time.
+        if let Some(g) = &inner.outgoing {
+            if g.time.elapsed() > Duration::from_secs(HANDOVER_GRACE as u64 + 5) {
+                g.child.kill();
+            } else {
+                g.child.term();
+            }
+            alarm::set(1);
+        }
 
         if let Some(mut p) = inner.scheduled.take() {
             if let Some(g) = inner.current.take() {
@@ -344,6 +448,22 @@ impl Context {
                 // We got an exit, see if it's something we need to clean up.
                 Ok(WaitStatus::Exited(pid, ..)) | Ok(WaitStatus::Signaled(pid, ..)) => {
                     let mut inner = self.inner.write().await;
+
+                    // The greeter that handed over is gone, as it should.
+                    if matches!(&inner.outgoing, Some(g) if g.child.owns_pid(pid)) {
+                        inner.outgoing = None;
+                        if inner.current.is_none() && inner.scheduled.is_none() {
+                            // So is the session it handed over to.
+                            sleep(Duration::from_secs(1)).await;
+                            inner.current = Some(SessionChildSet {
+                                child: self.start_next_greeter().await?,
+                                time: Instant::now(),
+                                is_greeter: true,
+                            });
+                        }
+                        continue;
+                    }
+
                     let (was_greeter, sesion_length) = match &inner.current {
                         Some(s) if s.child.owns_pid(pid) => {
                             let res = (s.is_greeter, s.time.elapsed());
@@ -373,11 +493,19 @@ impl Context {
                             if was_greeter {
                                 return Err("greeter exited without creating a session".into());
                             }
+                            if let Some(g) = &inner.outgoing {
+                                // The session ended while the greeter that
+                                // handed over to it is still up: a new one
+                                // is started once that one is gone. The
+                                // alarm kills one that does not go.
+                                g.child.term();
+                                continue;
+                            }
                             if sesion_length < Duration::from_secs(1) {
                                 sleep(Duration::from_secs(1)).await;
                             }
                             inner.current = Some(SessionChildSet {
-                                child: self.start_greeter().await?,
+                                child: self.start_next_greeter().await?,
                                 time: Instant::now(),
                                 is_greeter: true,
                             });
@@ -411,6 +539,9 @@ impl Context {
             let _ = sess.session.cancel().await;
         }
         if let Some(sess) = inner.current.take() {
+            sess.child.term();
+        }
+        if let Some(sess) = inner.outgoing.take() {
             sess.child.term();
         }
         Ok(())

@@ -102,11 +102,17 @@ impl Terminal {
 
     /// Switches to the specified VT and waits for completion of switch.
     fn vt_activate(&self, target_vt: usize) -> Result<(), Error> {
-        if let Err(v) = unsafe { ioctl::vt_activate(self.fd, target_vt as i32) } {
-            return Err(format!("terminal: unable to activate: {}", v).into());
-        }
+        self.vt_request(target_vt)?;
         if let Err(v) = unsafe { ioctl::vt_waitactive(self.fd, target_vt as i32) } {
             return Err(format!("terminal: unable to wait for activation: {}", v).into());
+        }
+        Ok(())
+    }
+
+    /// Requests a switch to the specified VT, without waiting for it.
+    pub fn vt_request(&self, target_vt: usize) -> Result<(), Error> {
+        if let Err(v) = unsafe { ioctl::vt_activate(self.fd, target_vt as i32) } {
+            return Err(format!("terminal: unable to activate: {}", v).into());
         }
         Ok(())
     }
@@ -117,6 +123,21 @@ impl Terminal {
             return Err(format!("terminal: unable to wait for activation: {}", v).into());
         }
         Ok(())
+    }
+
+    /// Whether the kernel switches this VT by itself, with no process to ask.
+    pub fn vt_is_auto(&self) -> Result<bool, Error> {
+        let mut mode = ioctl::vt_mode {
+            mode: ioctl::VT_AUTO,
+            waitv: 0,
+            relsig: 0,
+            acqsig: 0,
+            frsig: 0,
+        };
+        match unsafe { ioctl::vt_getmode(self.fd, &mut mode as *mut ioctl::vt_mode) } {
+            Ok(_) => Ok(mode.mode == ioctl::VT_AUTO),
+            Err(v) => Err(format!("terminal: unable to get vt mode: {}", v).into()),
+        }
     }
 
     /// Set the VT mode to VT_AUTO with everything cleared.
