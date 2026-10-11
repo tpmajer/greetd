@@ -180,13 +180,18 @@ impl Session {
     /// Cancel the session.
     pub async fn cancel(&mut self) -> Result<(), Error> {
         self.last_msg = None;
+        // A worker that is gone, after a failed authentication for one, has
+        // nothing left to cancel: that is not an error.
         let sent = ParentToSessionChild::Cancel.send(&mut self.sock).await;
         // The worker only reads Cancel between PAM's questions, so a module
         // that waits, such as a fingerprint reader's, would hold it until
         // its timeout. A session that has not been started has nothing to
-        // tear down, so end the worker instead.
-        let _ = nix::sys::signal::kill(self.task, Signal::SIGTERM);
-        sent
+        // tear down, so end the worker instead. Only one that took the
+        // message: the PID of one that is gone may be another process's.
+        if sent.is_ok() {
+            let _ = nix::sys::signal::kill(self.task, Signal::SIGTERM);
+        }
+        Ok(())
     }
 
     /// Send a response to an authentication question, or None to cancel the
