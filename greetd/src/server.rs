@@ -4,6 +4,7 @@ use nix::unistd::{chown, getpid, Gid, Uid};
 use tokio::{
     net::{UnixListener, UnixStream},
     signal::unix::{signal, SignalKind},
+    sync::mpsc,
     task,
 };
 
@@ -66,31 +67,100 @@ async fn client_get_question(ctx: &Context) -> Response {
     }
 }
 
-async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
-    loop {
-        let req = match Request::read_from(&mut s).await {
-            Ok(req) => req,
-            Err(CodecError::Eof) => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-
-        let resp = match req {
-            Request::CreateSession { username } => match ctx.create_session(username).await {
-                Ok(()) => client_get_question(ctx).await,
-                res => wrap_result(res),
-            },
-            Request::PostAuthMessageResponse { response } => {
-                match ctx.post_response(response).await {
-                    Ok(()) => client_get_question(ctx).await,
-                    res => wrap_result(res),
+/// Retrieve the session's next question, unless the client cancels first.
+/// The question can be a long time coming: a PAM module may wait by itself,
+/// pam_fprintd for a finger, and a cancel must not have to wait with it.
+async fn client_get_question_or_cancel(
+    ctx: &Context,
+    requests: &mut mpsc::Receiver<Request>,
+    next: &mut Option<Request>,
+) -> Response {
+    tokio::select! {
+        biased;
+        resp = client_get_question(ctx) => resp,
+        req = requests.recv() => match req {
+            // A client that is gone has cancelled as well: nobody is left
+            // to answer, and the wait would hold the context for its time.
+            Some(Request::CancelSession) | None => {
+                *next = Some(Request::CancelSession);
+                Response::Error {
+                    error_type: ErrorType::Error,
+                    description: "cancelled".to_string(),
                 }
             }
-            Request::StartSession { cmd, env } => wrap_result(ctx.start(cmd, env).await),
-            Request::CancelSession => wrap_result(ctx.cancel().await),
-        };
-
-        resp.write_to(&mut s).await?;
+            req => {
+                *next = req;
+                client_get_question(ctx).await
+            }
+        },
     }
+}
+
+async fn client_handler(ctx: &Context, s: UnixStream) -> Result<(), Error> {
+    let (mut rd, mut wr) = s.into_split();
+
+    // Requests are read as they come, not as they are answered, so that a
+    // cancel is seen while the answer to the request before it is awaited.
+    // The reader is never dropped mid-read: reading a request is not
+    // cancel-safe.
+    // A few at most: a client that does not wait for answers waits here.
+    let (tx, mut requests) = mpsc::channel(4);
+    let reader = async move {
+        loop {
+            match Request::read_from(&mut rd).await {
+                Ok(req) => {
+                    if tx.send(req).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(CodecError::Eof) => return Ok(()),
+                Err(e) => return Err(Error::from(e)),
+            }
+        }
+    };
+
+    let handler = async {
+        let mut next = None;
+        loop {
+            let req = match next.take() {
+                Some(req) => req,
+                None => match requests.recv().await {
+                    Some(req) => req,
+                    None => return Ok::<(), Error>(()),
+                },
+            };
+
+            let resp = match req {
+                Request::CreateSession { username } => match ctx.create_session(username).await {
+                    Ok(()) => client_get_question_or_cancel(ctx, &mut requests, &mut next).await,
+                    res => wrap_result(res),
+                },
+                Request::PostAuthMessageResponse { response } => {
+                    match ctx.post_response(response).await {
+                        Ok(()) => {
+                            client_get_question_or_cancel(ctx, &mut requests, &mut next).await
+                        }
+                        res => wrap_result(res),
+                    }
+                }
+                Request::StartSession { cmd, env } => wrap_result(ctx.start(cmd, env).await),
+                Request::CancelSession => wrap_result(ctx.cancel().await),
+            };
+
+            resp.write_to(&mut wr).await?;
+        }
+    };
+
+    tokio::pin!(reader);
+    tokio::pin!(handler);
+    let read = tokio::select! {
+        res = &mut handler => return res,
+        res = &mut reader => res,
+    };
+    // The client is gone, or what it sent last could not be read: what it
+    // had sent before is still handled, and no request is left half done.
+    handler.await?;
+    read
 }
 
 // Return a TTY path and the TTY/VT number, based on the configured target.
