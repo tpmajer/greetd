@@ -1,6 +1,9 @@
 use std::{
     ffi::CString,
-    os::unix::{io::AsRawFd, net::UnixDatagram},
+    os::unix::{
+        io::{AsRawFd, FromRawFd},
+        net::UnixDatagram,
+    },
 };
 
 use nix::{
@@ -49,10 +52,43 @@ impl AsyncRecv<SessionChildToParent> for SessionChildToParent {
             .recv(&mut data[..])
             .await
             .map_err(|e| format!("unable to recieve message: {}", e))?;
+        // The end of the socket: the worker has exited, or was killed.
+        if len == 0 {
+            return Err("the session worker is gone".into());
+        }
         let msg = serde_json::from_slice(&data[..len])
             .map_err(|e| format!("unable to deserialize message: {}", e))?;
         Ok(msg)
     }
+}
+
+/// The sockets greetd and a session worker talk over. A pair of sequenced
+/// packets, not of datagrams, which it is handled as: a datagram socket is
+/// not told that its peer is gone, and a worker that died would be waited
+/// for without end.
+fn worker_pair() -> Result<(UnixDatagram, UnixDatagram), Error> {
+    let mut fds = [0; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(format!(
+            "could not create pipe: {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    Ok(unsafe {
+        (
+            UnixDatagram::from_raw_fd(fds[0]),
+            UnixDatagram::from_raw_fd(fds[1]),
+        )
+    })
 }
 
 /// SessionChild tracks the processes spawned by a session
@@ -96,8 +132,7 @@ impl Session {
     /// Create a session started as an external process.
     pub fn new_external() -> Result<Session, Error> {
         // Pipe used to communicate the true PID of the final child.
-        let (parentfd, childfd) =
-            UnixDatagram::pair().map_err(|e| format!("could not create pipe: {}", e))?;
+        let (parentfd, childfd) = worker_pair()?;
 
         let raw_child = childfd.as_raw_fd();
         let mut cur_flags = FdFlag::from_bits_retain(fcntl(raw_child, FcntlArg::F_GETFD)?);
@@ -268,5 +303,60 @@ impl Session {
             task: self.task,
             sub_task,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn worker_messages_arrive_whole() {
+        let (parent, child) = worker_pair().unwrap();
+        parent.set_nonblocking(true).unwrap();
+        let mut parent = TokioUnixDatagram::from_std(parent).unwrap();
+
+        SessionChildToParent::Success.send(&child).unwrap();
+        SessionChildToParent::FinalChildPid(7).send(&child).unwrap();
+        assert!(matches!(
+            SessionChildToParent::recv(&mut parent).await,
+            Ok(SessionChildToParent::Success)
+        ));
+        assert!(matches!(
+            SessionChildToParent::recv(&mut parent).await,
+            Ok(SessionChildToParent::FinalChildPid(7))
+        ));
+
+        ParentToSessionChild::Start.send(&mut parent).await.unwrap();
+        let mut data = [0; 10240];
+        assert!(matches!(
+            ParentToSessionChild::recv(&child, &mut data),
+            Ok(ParentToSessionChild::Start)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_is_gone_is_an_error() {
+        let (parent, child) = worker_pair().unwrap();
+        parent.set_nonblocking(true).unwrap();
+        let mut parent = TokioUnixDatagram::from_std(parent).unwrap();
+
+        // What it sent before it went is still read.
+        SessionChildToParent::Success.send(&child).unwrap();
+        drop(child);
+        assert!(matches!(
+            SessionChildToParent::recv(&mut parent).await,
+            Ok(SessionChildToParent::Success)
+        ));
+        assert!(SessionChildToParent::recv(&mut parent).await.is_err());
+        assert!(ParentToSessionChild::Cancel.send(&mut parent).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn greetd_gone_ends_the_worker() {
+        let (parent, child) = worker_pair().unwrap();
+        drop(parent);
+        let mut data = [0; 10240];
+        assert!(ParentToSessionChild::recv(&child, &mut data).is_err());
     }
 }

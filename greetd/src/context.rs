@@ -328,7 +328,9 @@ impl Context {
             Ok(child) => child,
             Err(e) => {
                 // The worker may have switched VTs already: back to the
-                // greeter's, which is still there to say what happened.
+                // greeter's, which is still there to say what happened. One
+                // that was killed left its VT in graphics mode.
+                self.release_stuck_vt();
                 self.request_greeter_vt();
                 return Err(format!("session start failed: {}", e).into());
             }

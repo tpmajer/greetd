@@ -77,6 +77,10 @@ impl<'a> ParentToSessionChild<'a> {
         data: &'a mut [u8; 10240],
     ) -> Result<ParentToSessionChild<'a>, Error> {
         let len = sock.recv(&mut data[..])?;
+        // The end of the socket: nobody is left to start a session for.
+        if len == 0 {
+            return Err("greetd is gone".into());
+        }
         let msg = serde_json::from_slice(&data[..len])?;
         Ok(msg)
     }
