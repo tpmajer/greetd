@@ -207,6 +207,11 @@ impl Context {
             if inner.scheduled.is_some() {
                 return Err("a session is already scheduled".into());
             }
+            // The greeter is still up for a moment after a hand-over, and
+            // has had its session: what it would start would replace it.
+            if inner.outgoing.is_some() {
+                return Err("a session has already been handed over to".into());
+            }
         }
 
         let mut session_set = SessionSet {
@@ -337,6 +342,12 @@ impl Context {
         };
 
         let mut inner = self.inner.write().await;
+        // Two sessions started at once by the greeter: the first one stays,
+        // and the greeter is not lost track of.
+        if inner.outgoing.is_some() || !matches!(&inner.current, Some(g) if g.is_greeter) {
+            child.term();
+            return Err("a session has already been handed over to".into());
+        }
         inner.outgoing = inner.current.take().map(|g| SessionChildSet {
             time: Instant::now(),
             ..g
