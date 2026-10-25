@@ -92,6 +92,7 @@ pub enum SessionChildToParent {
     Error(Error),
     PamMessage { style: AuthMessageType, msg: String },
     FinalChildPid(u64),
+    HandoverVt(u64),
 }
 
 impl SessionChildToParent {
@@ -195,6 +196,9 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
         TerminalMode::Stdin => (),
         TerminalMode::Handover => {
             let vt = terminal::Terminal::open("/dev/tty0")?.vt_get_next()?;
+            // Before anything can fail: the VT is greetd's to put right
+            // if this worker ends without doing it.
+            SessionChildToParent::HandoverVt(vt as u64).send(sock)?;
 
             pam.set_item(PamItemType::TTY, &format!("tty{}", vt))?;
             pam.putenv(&format!("XDG_VTNR={}", vt))?;

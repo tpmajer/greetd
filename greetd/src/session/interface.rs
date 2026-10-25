@@ -95,6 +95,8 @@ fn worker_pair() -> Result<(UnixDatagram, UnixDatagram), Error> {
 pub struct SessionChild {
     pub task: Pid,
     pub sub_task: Pid,
+    /// The VT of its own that a hand-over's session is on.
+    pub vt: Option<usize>,
 }
 
 impl SessionChild {
@@ -126,6 +128,7 @@ pub struct Session {
     task: Pid,
     sock: TokioUnixDatagram,
     last_msg: Option<SessionChildToParent>,
+    vt: Option<usize>,
 }
 
 impl Session {
@@ -168,6 +171,7 @@ impl Session {
             task: child,
             sock: TokioUnixDatagram::from_std(parentfd)?,
             last_msg: None,
+            vt: None,
         })
     }
 
@@ -283,6 +287,10 @@ impl Session {
                 SessionChildToParent::FinalChildPid(raw_pid) => {
                     break Pid::from_raw(raw_pid as i32)
                 }
+                SessionChildToParent::HandoverVt(vt) => {
+                    self.vt = Some(vt as usize);
+                    continue;
+                }
                 SessionChildToParent::PamMessage { .. } => {
                     // pam_conv after start, ignore
                     ParentToSessionChild::PamResponse { resp: None }
@@ -302,7 +310,14 @@ impl Session {
         Ok(SessionChild {
             task: self.task,
             sub_task,
+            vt: self.vt,
         })
+    }
+
+    /// The VT a hand-over's session was given, if it got as far, for one
+    /// whose start failed too.
+    pub fn vt(&self) -> Option<usize> {
+        self.vt
     }
 }
 

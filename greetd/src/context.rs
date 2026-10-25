@@ -335,7 +335,9 @@ impl Context {
                 // The worker may have switched VTs already: back to the
                 // greeter's, which is still there to say what happened. One
                 // that was killed left its VT in graphics mode.
-                self.release_stuck_vt();
+                if let Some(vt) = s.session.vt() {
+                    release_stuck_vt(vt);
+                }
                 self.request_greeter_vt();
                 return Err(format!("session start failed: {}", e).into());
             }
@@ -374,35 +376,11 @@ impl Context {
     /// and a greeter that does not switch would not come back to it.
     async fn start_next_greeter(&self) -> Result<SessionChild, Error> {
         if let TerminalMode::Handover = self.session_term_mode {
-            self.release_stuck_vt();
             if let TerminalMode::Terminal { switch: false, .. } = self.term_mode {
                 self.request_greeter_vt();
             }
         }
         self.start_greeter().await
-    }
-
-    /// A session's worker that was killed did not put its VT back in text
-    /// mode. If the VT in front is in graphics mode with no process to ask
-    /// for a switch, the kernel ignores every switch away from it, and the
-    /// greeter would wait for its VT for good: back to text.
-    fn release_stuck_vt(&self) {
-        let greeter_vt = match &self.term_mode {
-            TerminalMode::Terminal { vt, .. } => *vt,
-            _ => return,
-        };
-        let current = match Terminal::open("/dev/tty0").and_then(|t| t.vt_get_current()) {
-            Ok(vt) => vt,
-            Err(_) => return,
-        };
-        if current == greeter_vt {
-            return;
-        }
-        if let Ok(term) = Terminal::open(&format!("/dev/tty{}", current)) {
-            if let Ok(true) = term.vt_is_auto() {
-                let _ = term.kd_setmode(crate::terminal::KdMode::Text);
-            }
-        }
     }
 
     /// Notify the Context of an alarm.
@@ -479,6 +457,9 @@ impl Context {
 
                     let (was_greeter, sesion_length) = match &inner.current {
                         Some(s) if s.child.owns_pid(pid) => {
+                            if let Some(vt) = s.child.vt {
+                                release_stuck_vt(vt);
+                            }
                             let res = (s.is_greeter, s.time.elapsed());
                             inner.current = None;
                             res
@@ -558,5 +539,18 @@ impl Context {
             sess.child.term();
         }
         Ok(())
+    }
+}
+
+/// A session's worker that was killed did not put the session's VT back in
+/// text mode. A VT in graphics mode with no process to ask for a switch
+/// cannot be left: the kernel ignores every switch away from it, and the
+/// next greeter would wait for its VT for good. Only the session's own VT,
+/// and not one a compositor still holds.
+fn release_stuck_vt(vt: usize) {
+    if let Ok(term) = Terminal::open(&format!("/dev/tty{}", vt)) {
+        if let Ok(true) = term.vt_is_auto() {
+            let _ = term.kd_setmode(crate::terminal::KdMode::Text);
+        }
     }
 }
