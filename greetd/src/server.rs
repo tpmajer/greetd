@@ -1,7 +1,8 @@
-use std::{path::Path, rc::Rc};
+use std::{fs::Permissions, os::unix::fs::PermissionsExt, path::Path, rc::Rc};
 
 use nix::unistd::{chown, getpid, Gid, Uid};
 use tokio::{
+    io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
     signal::unix::{signal, SignalKind},
     sync::mpsc,
@@ -19,6 +20,10 @@ use greetd_ipc::{
     codec::{Error as CodecError, TokioCodec},
     ErrorType, Request, Response,
 };
+
+/// Where a session asks for a hand-back. Anyone may connect: the peer's
+/// user decides.
+const HANDBACK_PATH: &str = "/run/greetd-handback.sock";
 
 fn reset_vt(term_mode: &TerminalMode) -> Result<(), Error> {
     match term_mode {
@@ -163,6 +168,20 @@ async fn client_handler(ctx: &Context, s: UnixStream) -> Result<(), Error> {
     read
 }
 
+/// A session asks for a hand-back by connecting, and is told how it went.
+async fn handback_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
+    let uid = s.peer_cred()?.uid();
+    let answer: &[u8] = match ctx.hand_back(uid).await {
+        Ok(()) => b"ok\n",
+        Err(e) => {
+            eprintln!("hand-back refused: {}", e);
+            b"refused\n"
+        }
+    };
+    s.write_all(answer).await?;
+    Ok(())
+}
+
 // Return a TTY path and the TTY/VT number, based on the configured target.
 //
 // If the target is VtSelection::Current, return the path to the TTY
@@ -253,6 +272,23 @@ impl Listener {
             .map_err(|e| format!("unable to chown greetd socket at {}: {}", path, e))?;
         Ok((path, Listener(listener)))
     }
+
+    fn create_handback(path: &str) -> Result<Listener, Error> {
+        let _ = std::fs::remove_file(path);
+        let listener =
+            UnixListener::bind(path).map_err(|e| format!("unable to open listener: {}", e))?;
+        std::fs::set_permissions(path, Permissions::from_mode(0o666))
+            .map_err(|e| format!("unable to open up socket at {}: {}", path, e))?;
+        Ok(Listener(listener))
+    }
+}
+
+/// The next connection, if there is a listener to have one.
+async fn accept(listener: &Option<Listener>) -> std::io::Result<UnixStream> {
+    match listener {
+        Some(l) => l.0.accept().await.map(|(stream, _)| stream),
+        None => std::future::pending().await,
+    }
 }
 
 impl Drop for Listener {
@@ -300,6 +336,11 @@ pub async fn main(config: Config) -> Result<(), Error> {
     ))?;
 
     let (listener_path, listener) = Listener::create(u.uid, u.gid)?;
+    let handback = if config.file.terminal.handover {
+        Some(Listener::create_handback(HANDBACK_PATH)?)
+    } else {
+        None
+    };
 
     let term_mode = get_tty(&config)?;
 
@@ -363,9 +404,53 @@ pub async fn main(config: Config) -> Result<(), Error> {
                     });
                 },
                 Err(err) => return Err(format!("accept: {}", err).into()),
+            },
+            stream = accept(&handback) => match stream {
+                Ok(stream) => {
+                    let client_ctx = ctx.clone();
+                    task::spawn_local(async move {
+                        if let Err(e) = handback_handler(&client_ctx, stream).await {
+                            eprintln!("hand-back failed: {}", e);
+                        }
+                    });
+                },
+                // Out of descriptors, say: still readable, and not worth
+                // a busy loop or an exit.
+                Err(err) => {
+                    eprintln!("accept: {}", err);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[tokio::test]
+    async fn handback_socket_is_open_to_all_and_replaced() {
+        let dir = std::env::temp_dir().join(format!("greetd-test-{}", getpid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("handback.sock");
+        let path = path.to_str().unwrap();
+        std::fs::write(path, "stale").unwrap();
+
+        let listener = Listener::create_handback(path).unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().mode() & 0o777, 0o666);
+        let _client = UnixStream::connect(path).await.unwrap();
+        let (stream, _) = listener.0.accept().await.unwrap();
+        assert_eq!(
+            stream.peer_cred().unwrap().uid(),
+            nix::unistd::getuid().as_raw()
+        );
+
+        drop(listener);
+        assert!(!Path::new(path).exists());
+        std::fs::remove_dir(&dir).unwrap();
+    }
 }

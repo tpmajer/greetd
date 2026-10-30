@@ -1,6 +1,7 @@
 use std::{
     ffi::CString,
     os::unix::{
+        fs::MetadataExt,
         io::{AsRawFd, FromRawFd},
         net::UnixDatagram,
     },
@@ -103,6 +104,13 @@ impl SessionChild {
     /// Check if this session has this pid.
     pub fn owns_pid(&self, pid: Pid) -> bool {
         self.task == pid
+    }
+
+    /// The user the session runs as, while it is there.
+    pub fn uid(&self) -> Option<u32> {
+        std::fs::metadata(format!("/proc/{}", self.sub_task))
+            .ok()
+            .map(|m| m.uid())
     }
 
     /// Send SIGTERM to the session child.

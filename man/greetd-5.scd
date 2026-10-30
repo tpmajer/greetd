@@ -61,6 +61,12 @@ This section contains terminal configuration.
 	graphics mode to cope with. Needs *vt* to be a VT, and has no effect on
 	*initial_session*.
 
+	A session can also hand back for a logout: a process of the session's
+	user connects to _/run/greetd-handback.sock_, a greeter is started the same
+	way, and "ok" or "refused" is answered. The session is left running on its
+	VT and is to end itself a few seconds later, or it is terminated. A session
+	the greeter starts meanwhile waits for that.
+
 	Default is false.
 
 ## general

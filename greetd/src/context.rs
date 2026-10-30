@@ -36,7 +36,8 @@ struct ContextInner {
     current: Option<SessionChildSet>,
     scheduled: Option<SessionSet>,
     configuring: Option<SessionSet>,
-    /// The greeter that handed over to `current`, kept for a moment.
+    /// The greeter that handed over to `current`, or the session that handed
+    /// back to the greeter in it, kept for a moment.
     outgoing: Option<SessionChildSet>,
 }
 
@@ -44,6 +45,22 @@ struct ContextInner {
 /// last showed is on the display until the session's compositor takes it,
 /// and would go with the greeter.
 const HANDOVER_GRACE: u32 = 3;
+
+/// How long a session is kept after it has handed back, in seconds. It is its
+/// own to end, a few seconds in, and its teardown is cut short by a SIGTERM:
+/// this is for one that does not end at all.
+const HANDBACK_GRACE: u32 = 15;
+
+impl SessionChildSet {
+    /// How long this one is kept once it is outgoing.
+    fn grace(&self) -> u32 {
+        if self.is_greeter {
+            HANDOVER_GRACE
+        } else {
+            HANDBACK_GRACE
+        }
+    }
+}
 
 /// Context keeps track of running sessions and start new ones.
 pub struct Context {
@@ -107,6 +124,21 @@ impl Context {
         service: &str,
         cmd: Vec<String>,
     ) -> Result<SessionChild, Error> {
+        self.prepare_unauthenticated_session(class, user, service, cmd, &self.term_mode)
+            .await?
+            .start()
+            .await
+    }
+
+    /// An unauthenticated session up to its start, on the given terminal.
+    async fn prepare_unauthenticated_session(
+        &self,
+        class: SessionClass,
+        user: &str,
+        service: &str,
+        cmd: Vec<String>,
+        term_mode: &TerminalMode,
+    ) -> Result<Session, Error> {
         let mut scheduled_session = Session::new_external()?;
         scheduled_session
             .initiate(
@@ -114,7 +146,7 @@ impl Context {
                 class,
                 user,
                 false,
-                &self.term_mode,
+                term_mode,
                 self.source_profile,
                 &self.listener_path,
             )
@@ -128,7 +160,7 @@ impl Context {
         }
 
         scheduled_session.send_args(cmd, vec![]).await?;
-        scheduled_session.start().await
+        Ok(scheduled_session)
     }
 
     /// Directly start a greeter session, bypassing the normal scheduling. This
@@ -208,8 +240,10 @@ impl Context {
                 return Err("a session is already scheduled".into());
             }
             // The greeter is still up for a moment after a hand-over, and
-            // has had its session: what it would start would replace it.
-            if inner.outgoing.is_some() {
+            // has had its session: what it would start would replace it. A
+            // session that handed back is no obstacle yet: the login can go
+            // on while it ends, and only its start waits.
+            if matches!(&inner.outgoing, Some(g) if g.is_greeter) {
                 return Err("a session has already been handed over to".into());
             }
         }
@@ -329,6 +363,8 @@ impl Context {
     /// Start the session on a VT of its own at once, with the greeter still
     /// up on its VT, and retire the greeter a moment later.
     async fn hand_over(&self, s: &mut SessionSet) -> Result<(), Error> {
+        self.wait_for_session_handed_back().await?;
+
         let child = match s.session.start().await {
             Ok(child) => child,
             Err(e) => {
@@ -338,7 +374,15 @@ impl Context {
                 if let Some(vt) = s.session.vt() {
                     release_stuck_vt(vt);
                 }
-                self.request_greeter_vt();
+                // A greeter that came after a hand-back has a VT of its own.
+                let greeter_vt = match &self.inner.read().await.current {
+                    Some(g) => g.child.vt,
+                    None => None,
+                };
+                match greeter_vt {
+                    Some(vt) => request_vt(vt),
+                    None => self.request_greeter_vt(),
+                }
                 return Err(format!("session start failed: {}", e).into());
             }
         };
@@ -363,12 +407,93 @@ impl Context {
         Ok(())
     }
 
+    /// The session that handed back is still ending, and the next one must
+    /// not find it running. A killed one is gone in time.
+    async fn wait_for_session_handed_back(&self) -> Result<(), Error> {
+        let asked = Instant::now();
+        loop {
+            match &self.inner.read().await.outgoing {
+                Some(g) if !g.is_greeter => {
+                    if asked.elapsed() > Duration::from_secs(g.grace() as u64 + 10) {
+                        return Err("the last session does not end".into());
+                    }
+                }
+                _ => return Ok(()),
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// A hand-over the other way, for a logout, asked for by the user of the
+    /// session in front: a greeter is started at once on the next free VT,
+    /// with the session still up on its VT. The session's compositor is then
+    /// not ended on the VT in front, where giving the display back to the
+    /// console shows. Should the greeter not start, the session is switched
+    /// back to, and nothing is lost; should it die later, the session is
+    /// ended and another one started.
+    pub async fn hand_back(&self, uid: u32) -> Result<(), Error> {
+        if !matches!(self.session_term_mode, TerminalMode::Handover) {
+            return Err("hand-overs are off".into());
+        }
+
+        // Held to the end. Anyone can ask: nobody queues for it, a greeter
+        // waiting for a finger holds it for seconds.
+        let mut inner = self.inner.try_write().map_err(|_| "greetd is busy")?;
+        if inner.outgoing.is_some() {
+            return Err("a hand-over is under way".into());
+        }
+        let session_vt = match &inner.current {
+            Some(s) if !s.is_greeter && s.child.uid() == Some(uid) => s.child.vt,
+            _ => return Err("not the session's user".into()),
+        }
+        .ok_or("the session has no VT of its own")?;
+        let front = Terminal::open("/dev/tty0")?.vt_get_current()?;
+        if front != session_vt {
+            return Err("the session is not in front".into());
+        }
+        // No compositor holds it yet: the kernel would ignore the switch away,
+        // and the greeter would wait for it for good, with the lock held.
+        if Terminal::open(&format!("/dev/tty{}", session_vt))?.vt_is_auto()? {
+            return Err("no compositor on the session's VT".into());
+        }
+
+        let mut greeter = self
+            .prepare_unauthenticated_session(
+                SessionClass::Greeter,
+                &self.greeter_user,
+                &self.greeter_service,
+                vec![self.greeter_bin.to_string()],
+                &TerminalMode::Handover,
+            )
+            .await?;
+        let child = match greeter.start().await {
+            Ok(child) => child,
+            Err(e) => {
+                if let Some(vt) = greeter.vt() {
+                    release_stuck_vt(vt);
+                }
+                request_vt(session_vt);
+                return Err(format!("greeter start failed: {}", e).into());
+            }
+        };
+
+        inner.outgoing = inner.current.take().map(|s| SessionChildSet {
+            time: Instant::now(),
+            ..s
+        });
+        inner.current = Some(SessionChildSet {
+            child,
+            time: Instant::now(),
+            is_greeter: true,
+        });
+        alarm::set(HANDBACK_GRACE);
+        Ok(())
+    }
+
     /// Ask for the greeter's VT, without waiting for it.
     fn request_greeter_vt(&self) {
-        if let TerminalMode::Terminal { path, vt, .. } = &self.term_mode {
-            if let Ok(term) = Terminal::open(path) {
-                let _ = term.vt_request(*vt);
-            }
+        if let TerminalMode::Terminal { vt, .. } = &self.term_mode {
+            request_vt(*vt);
         }
     }
 
@@ -390,7 +515,7 @@ impl Context {
 
         // A greeter kept through a hand-over has had its time.
         if let Some(g) = &inner.outgoing {
-            if g.time.elapsed() > Duration::from_secs(HANDOVER_GRACE as u64 + 5) {
+            if g.time.elapsed() > Duration::from_secs(g.grace() as u64 + 5) {
                 g.child.kill();
             } else {
                 g.child.term();
@@ -442,7 +567,10 @@ impl Context {
 
                     // The greeter that handed over is gone, as it should.
                     if matches!(&inner.outgoing, Some(g) if g.child.owns_pid(pid)) {
-                        inner.outgoing = None;
+                        // One that was killed left its VT in graphics mode.
+                        if let Some(vt) = inner.outgoing.take().and_then(|g| g.child.vt) {
+                            release_stuck_vt(vt);
+                        }
                         if inner.current.is_none() && inner.scheduled.is_none() {
                             // So is the session it handed over to.
                             sleep(Duration::from_secs(1)).await;
@@ -484,14 +612,16 @@ impl Context {
                             });
                         }
                         None => {
-                            if was_greeter {
+                            if was_greeter && inner.outgoing.is_none() {
                                 return Err("greeter exited without creating a session".into());
                             }
                             if let Some(g) = &inner.outgoing {
                                 // The session ended while the greeter that
-                                // handed over to it is still up: a new one
-                                // is started once that one is gone. The
-                                // alarm kills one that does not go.
+                                // handed over to it is still up, or the
+                                // greeter a session handed back to while the
+                                // session is: a new one is started once that
+                                // one is gone. The alarm kills one that does
+                                // not go.
                                 g.child.term();
                                 continue;
                             }
@@ -542,6 +672,13 @@ impl Context {
     }
 }
 
+/// Ask for a VT, without waiting for it.
+fn request_vt(vt: usize) {
+    if let Ok(term) = Terminal::open(&format!("/dev/tty{}", vt)) {
+        let _ = term.vt_request(vt);
+    }
+}
+
 /// A session's worker that was killed did not put the session's VT back in
 /// text mode. A VT in graphics mode with no process to ask for a switch
 /// cannot be left: the kernel ignores every switch away from it, and the
@@ -552,5 +689,34 @@ fn release_stuck_vt(vt: usize) {
         if let Ok(true) = term.vt_is_auto() {
             let _ = term.kd_setmode(crate::terminal::KdMode::Text);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(handover: bool) -> Context {
+        Context::new(
+            "greeter".to_string(),
+            "greeter".to_string(),
+            "greetd".to_string(),
+            "greetd".to_string(),
+            TerminalMode::Terminal {
+                path: "/dev/tty1".to_string(),
+                vt: 1,
+                switch: true,
+            },
+            handover,
+            false,
+            "/nonexistent".to_string(),
+            "/nonexistent".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn no_hand_back_without_a_session_or_hand_overs() {
+        assert!(context(true).hand_back(1000).await.is_err());
+        assert!(context(false).hand_back(1000).await.is_err());
     }
 }
